@@ -17,6 +17,7 @@ use crate::notice::Notice;
 use crate::subscription::Subscription;
 use crate::validation;
 use crate::validation::SubmittedEvent;
+use crate::nauthz::nostr_grpc_server;
 use prometheus::IntCounterVec;
 use prometheus::IntGauge;
 use prometheus::{Encoder, Histogram, IntCounter, HistogramOpts, Opts, Registry, TextEncoder};
@@ -459,6 +460,13 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         // build a repository for events
         let repo = db::build_repo(&settings, metrics.clone()).await;
 
+        // tokio::task::spawn(
+        //     validation::submitted_event_stresstest(
+        //         submitted_event_tx.clone(),
+        //     ));
+        // info!("event submit validator created");
+
+
         // start validation task.  Give it a channel for writing events,
         // and for publishing events are validated and ready to store/broadcast.
         tokio::task::spawn(
@@ -484,6 +492,15 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
                 shutdown_listen,
             ));
         info!("db writer created");
+
+        if settings.grpc.enable_relay_server == Some(true) {
+            tokio::task::spawn(
+                nostr_grpc_server(
+                    bcast_tx.clone(),
+                    settings.grpc.relay_server_port,
+                )
+            );
+        }
 
         // create a nip-05 verifier thread; if enabled.
         if settings.verified_users.mode != VerifiedUsersMode::Disabled {
@@ -694,12 +711,12 @@ async fn nostr_server(
     let mut client_received_event_count: usize = 0;
 
     let unspec = "<unspecified>".to_string();
-    info!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
+    debug!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
     let origin = client_info.origin.as_ref().unwrap_or_else(|| &unspec);
     let user_agent = client_info
         .user_agent.as_ref()
         .unwrap_or_else(|| &unspec);
-    info!(
+    debug!(
         "cid: {}, origin: {:?}, user-agent: {:?}",
         cid, origin, user_agent
     );
@@ -802,7 +819,7 @@ async fn nostr_server(
                          Err(WsError::AlreadyClosed | WsError::ConnectionClosed |
                              WsError::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)))
                         => {
-                            debug!("websocket close from client (cid: {}, ip: {:?})",cid, conn.ip());
+                            warn!("websocket close from client (cid: {}, ip: {:?})",cid, conn.ip());
 			                metrics.disconnects.with_label_values(&["normal"]).inc();
                             break;
                         },
@@ -976,7 +993,7 @@ async fn nostr_server(
     for (_, stop_tx) in running_queries {
         stop_tx.send(()).ok();
     }
-    info!(
+    debug!(
         "stopping client connection (cid: {}, ip: {:?}, sent: {} events, recv: {} events, connected: {:?})",
         cid,
         conn.ip(),

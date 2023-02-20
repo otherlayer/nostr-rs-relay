@@ -9,6 +9,10 @@ service Authorization {
   rpc EventAdmit(EventRequest) returns (EventReply) {}
 }
 
+service Relay {
+  rpc Broadcast(BroadcastEventRequest) returns (BroadcastEventResponse) {}
+}
+
 message Event {
   bytes id = 1;                // 32-byte SHA256 hash of serialized event
   bytes pubkey = 2;            // 32-byte public key of event creator
@@ -57,4 +61,14 @@ enum Decision {
 message EventReply {
   Decision decision = 1;       // decision to enforce
   optional string message = 2; // informative message for the client
+}
+
+message BroadcastEventRequest {
+  Event event =
+      1;  // the event to be admitted for broadcast
+}
+
+message BroadcastEventResponse {
+  bool admitted =
+      1; // event succesfully admitted for further processing
 }

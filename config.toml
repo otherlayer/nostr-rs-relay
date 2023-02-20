@@ -58,9 +58,14 @@ description = "A newly created nostr-rs-relay.\n\nCustomize this with your own i
 #
 # Events can be authorized through an external service, by providing
 # the URL below.  In the event the server is not accessible, events
-# will be permitted.  The protobuf3 schema used is available in
+# will be permitted. The protobuf3 schema used is available in
 # `proto/nauthz.proto`.
-# event_admission_server = "http://[::1]:50051"
+event_admission_server = "http://[::1]:50051"
+
+# On 'Unspecified' reply it is expected that client
+# will admit event after processing using gRPC relay server.
+# enable_relay_server = false
+# relay_server_grpc_port = 50050
 
 [network]
 # Bind to this network address

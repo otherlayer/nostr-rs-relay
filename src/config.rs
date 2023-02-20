@@ -30,6 +30,8 @@ pub struct Database {
 #[allow(unused)]
 pub struct Grpc {
     pub event_admission_server: Option<String>,
+    pub enable_relay_server: Option<bool>,
+    pub relay_server_port: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +235,8 @@ impl Default for Settings {
             },
             grpc: Grpc {
                 event_admission_server: None,
+                enable_relay_server: None,
+                relay_server_port: 50050,
             },
             network: Network {
                 port: 8080,

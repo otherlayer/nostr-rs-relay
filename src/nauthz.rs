@@ -2,8 +2,13 @@ use crate::error::{Error, Result};
 use crate::{event::Event, nip05::Nip05Name};
 use nauthz_grpc::authorization_client::AuthorizationClient;
 use nauthz_grpc::event::TagEntry;
-use nauthz_grpc::{Decision, Event as GrpcEvent, EventReply, EventRequest};
-use tracing::{info, warn};
+use nauthz_grpc::relay_server::{Relay, RelayServer};
+use nauthz_grpc::{Decision, Event as GrpcEvent, EventReply, EventRequest, BroadcastEventRequest, BroadcastEventResponse};
+use tokio::sync::broadcast::Sender;
+use tracing::{info, warn, debug};
+
+use tonic::transport::Server;
+use tonic::{Request, Status, Response};
 
 pub mod nauthz_grpc {
     tonic::include_proto!("nauthz");
@@ -112,4 +117,66 @@ impl EventAuthzService {
             return Err(Error::AuthzError);
         }
     }
+}
+
+// Nostr relay server
+pub struct NostrRelay {
+    bcast: Sender<Event>,
+}
+
+#[tonic::async_trait]
+impl Relay for NostrRelay {
+    async fn broadcast(
+        &self,
+        request: Request<BroadcastEventRequest>,
+    ) -> Result<Response<BroadcastEventResponse>, Status> {
+        let req = request.into_inner();
+        let grpc_event = req.event.unwrap();
+        let content_prefix: String = grpc_event.content.chars().take(40).collect();
+
+        debug!("recvd event for broadcast, kind={:?}, tag_count={}, content_sample={:?}]",
+        grpc_event.kind, grpc_event.tags.len(), content_prefix);
+
+        let event = Event {
+            id: hex::encode(grpc_event.id),
+            pubkey: hex::encode(grpc_event.pubkey),
+            delegated_by: None,
+            created_at: grpc_event.created_at,
+            kind: grpc_event.kind,
+            tags: protobuf_to_tags(&grpc_event.tags),
+            content: grpc_event.content,
+            sig: hex::encode(grpc_event.sig),
+            tagidx: None,
+        };
+
+        let result = self.bcast.send(event).is_ok();
+
+        Ok(Response::new(BroadcastEventResponse { admitted: result }))
+    }
+}
+
+pub async fn nostr_grpc_server(
+    bcast: Sender<Event>,
+    port: u32,
+) -> Result<()> {
+    let addr = format!("[::1]:{}", port).parse().unwrap();
+
+    // A simple authorization engine that allows kinds 0-3
+    let relay = NostrRelay {
+        bcast,
+    };
+    info!("Relay gRPC Server listening on {}", addr);
+    // Start serving
+    Server::builder()
+        .add_service(RelayServer::new(relay))
+        .serve(addr)
+        .await.ok();
+    
+    Ok(())
+}
+
+fn protobuf_to_tags(tags: &Vec<TagEntry>) -> Vec<Vec<String>> {
+    tags.iter()
+        .map(|x| x.clone().values.to_vec() )
+        .collect()
 }

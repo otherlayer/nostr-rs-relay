@@ -129,7 +129,7 @@ pub async fn db_writer(
                         trace!("ignoring duplicate or deleted event");
                         notice_tx.try_send(Notice::duplicate(event.id)).ok();
                     } else {
-                        info!(
+                        debug!(
                             "persisted event: {:?} (kind: {}) from: {:?} in: {:?}",
                             event.get_event_id_prefix(),
                             event.kind,

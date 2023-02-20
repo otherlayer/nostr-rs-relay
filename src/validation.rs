@@ -23,6 +23,12 @@ pub struct SubmittedEvent {
     pub auth_pubkey: Option<Vec<u8>>,
 }
 
+// pub async fn submitted_event_stresstest(
+//     submitted_event_tx: tokio::sync::mpsc::Sender<SubmittedEvent>,
+// ) -> Result<()> {
+
+//     Ok(())
+// }
 
 /// Spawn a submission validator that validates events according to:
 /// - NIP05 verification
