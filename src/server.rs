@@ -57,6 +57,7 @@ use tungstenite::handshake;
 use tungstenite::protocol::Message;
 use tungstenite::protocol::WebSocketConfig;
 use crate::server::Error::CommandUnknownError;
+use uuid::Uuid;
 
 /// Handle arbitrary HTTP requests, including for `WebSocket` upgrades.
 #[allow(clippy::too_many_arguments)]
@@ -679,13 +680,15 @@ async fn nostr_server(
             sub_lim_opt = Some(RateLimiter::direct(quota));
         }
     }
-    // Use the remote IP as the client identifier
-    let cid = conn.get_client_prefix();
+    let cid_prefix = conn.get_client_prefix();
+    let client_id = conn.get_client_id();
+
     // Create a channel for receiving query results from the database.
     // we will send out the tx handle to any query we generate.
     // this has capacity for some of the larger requests we see, which
     // should allow the DB thread to release the handle earlier.
     let (query_tx, mut query_rx) = mpsc::channel::<db::QueryResult>(20_000);
+    
     // Create channel for receiving NOTICEs
     let (notice_tx, mut notice_rx) = mpsc::channel::<Notice>(128);
 
@@ -705,20 +708,21 @@ async fn nostr_server(
     // when these subscriptions are cancelled, make a message
     // available to the executing query so it knows to stop.
     let mut running_queries: HashMap<String, oneshot::Sender<()>> = HashMap::new();
+
     // for stats, keep track of how many events the client published,
     // and how many it received from queries.
     let mut client_published_event_count: usize = 0;
     let mut client_received_event_count: usize = 0;
 
     let unspec = "<unspecified>".to_string();
-    debug!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
+    debug!("new client connection (cid: {}, ip: {:?})", cid_prefix, conn.ip());
     let origin = client_info.origin.as_ref().unwrap_or_else(|| &unspec);
     let user_agent = client_info
         .user_agent.as_ref()
         .unwrap_or_else(|| &unspec);
     debug!(
         "cid: {}, origin: {:?}, user-agent: {:?}",
-        cid, origin, user_agent
+        cid_prefix, origin, user_agent
     );
 
     // Measure connections
@@ -736,7 +740,7 @@ async fn nostr_server(
         tokio::select! {
             _ = shutdown.recv() => {
 		metrics.disconnects.with_label_values(&["shutdown"]).inc();
-                info!("Close connection down due to shutdown, client: {}, ip: {:?}, connected: {:?}", cid, conn.ip(), orig_start.elapsed());
+                info!("Close connection down due to shutdown, client: {}, ip: {:?}, connected: {:?}", cid_prefix, conn.ip(), orig_start.elapsed());
                 // server shutting down, exit loop
                 break;
             },
@@ -780,7 +784,7 @@ async fn nostr_server(
                     // once for each consumer.
                     if let Ok(event_str) = serde_json::to_string(&global_event) {
                         trace!("sub match for client: {}, sub: {:?}, event: {:?}",
-                               cid, s,
+                               cid_prefix, s,
                                global_event.get_event_id_prefix());
                         // create an event response and send it
                         let subesc = s.replace('"', "");
@@ -819,20 +823,20 @@ async fn nostr_server(
                          Err(WsError::AlreadyClosed | WsError::ConnectionClosed |
                              WsError::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)))
                         => {
-                            warn!("websocket close from client (cid: {}, ip: {:?})",cid, conn.ip());
+                            warn!("websocket close from client (cid: {}, ip: {:?})",cid_prefix, conn.ip());
 			                metrics.disconnects.with_label_values(&["normal"]).inc();
                             break;
                         },
                     Some(Err(WsError::Io(e))) => {
                         // IO errors are considered fatal
-                        warn!("IO error (cid: {}, ip: {:?}): {:?}", cid, conn.ip(), e);
+                        warn!("IO error (cid: {}, ip: {:?}): {:?}", cid_prefix, conn.ip(), e);
 			            metrics.disconnects.with_label_values(&["error"]).inc();
 
                         break;
                     }
                     x => {
                         // default condition on error is to close the client connection
-                        info!("unknown error (cid: {}, ip: {:?}): {:?} (closing conn)", cid, conn.ip(), x);
+                        info!("unknown error (cid: {}, ip: {:?}): {:?} (closing conn)", cid_prefix, conn.ip(), x);
 			            metrics.disconnects.with_label_values(&["error"]).inc();
 
                         break;
@@ -852,7 +856,7 @@ async fn nostr_server(
                             Ok(WrappedEvent(e)) => {
                                 metrics.cmd_event.inc();
                                 let id_prefix:String = e.id.chars().take(8).collect();
-                                debug!("successfully parsed/validated event: {:?} (cid: {}, kind: {})", id_prefix, cid, e.kind);
+                                debug!("successfully parsed/validated event: {:?} (cid: {}, kind: {})", id_prefix, cid_prefix, e.kind);
                                 // check if event is expired
                                 if e.is_expired() {
                                     let notice = Notice::invalid(e.id, "The event has already expired");
@@ -871,7 +875,7 @@ async fn nostr_server(
                                         submitted_event_tx.send(submit_event).await.ok();
                                     client_published_event_count += 1;
                                 } else {
-                                    info!("client: {} sent a far future-dated event", cid);
+                                    info!("client: {} sent a far future-dated event", cid_prefix);
                                     if let Some(fut_sec) = settings.options.reject_future_seconds {
                                         let msg = format!("The event created_at field is out of the acceptable range (+{fut_sec}sec) for this relay.");
                                         let notice = Notice::invalid(e.id, &msg);
@@ -883,10 +887,10 @@ async fn nostr_server(
                                 metrics.cmd_auth.inc();
                                 if settings.authorization.nip42_auth {
                                     let id_prefix:String = event.id.chars().take(8).collect();
-                                    debug!("successfully parsed auth: {:?} (cid: {})", id_prefix, cid);
+                                    debug!("successfully parsed auth: {:?} (cid: {})", id_prefix, cid_prefix);
                                     match &settings.info.relay_url {
                                         None => {
-                                            error!("AUTH command received, but relay_url is not set in the config file (cid: {})", cid);
+                                            error!("AUTH command received, but relay_url is not set in the config file (cid: {})", cid_prefix);
                                         },
                                         Some(relay) => {
                                             match conn.authenticate(&event, &relay) {
@@ -895,10 +899,10 @@ async fn nostr_server(
                                                         Some(k) => k.chars().take(8).collect(),
                                                         None => "<unspecified>".to_string(),
                                                     };
-                                                    info!("client is authenticated: (cid: {}, pubkey: {:?})", cid, pubkey);
+                                                    info!("client is authenticated: (cid: {}, pubkey: {:?})", cid_prefix, pubkey);
                                                 },
                                                 Err(e) => {
-                                                    info!("authentication error: {} (cid: {})", e, cid);
+                                                    info!("authentication error: {} (cid: {})", e, cid_prefix);
                                                     ws_stream.send(make_notice_message(&Notice::message(format!("Authentication error: {e}")))).await.ok();
                                                 },
                                             }
@@ -906,19 +910,19 @@ async fn nostr_server(
                                     }
                                 } else {
                                     let e = CommandUnknownError;
-                                    info!("client sent an invalid event (cid: {})", cid);
+                                    info!("client sent an invalid event (cid: {})", cid_prefix);
                                     ws_stream.send(make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await.ok();
                                 }
                             },
                             Err(e) => {
                                 metrics.cmd_event.inc();
-                                info!("client sent an invalid event (cid: {})", cid);
+                                info!("client sent an invalid event (cid: {})", cid_prefix);
                                 ws_stream.send(make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await.ok();
                             }
                         }
                     },
                     Ok(NostrMessage::SubMsg(s)) => {
-                        debug!("subscription requested (cid: {}, sub: {:?})", cid, s.id);
+                        debug!("subscription requested (cid: {}, sub: {:?})", cid_prefix, s.id);
                         // subscription handling consists of:
                         // * check for rate limits
                         // * registering the subscription so future events can be matched
@@ -926,7 +930,7 @@ async fn nostr_server(
                         // * sending a request for a SQL query
                         // Do nothing if the sub already exists.
                         if conn.has_subscription(&s) {
-                            info!("client sent duplicate subscription, ignoring (cid: {}, sub: {:?})", cid, s.id);
+                            info!("client sent duplicate subscription, ignoring (cid: {}, sub: {:?})", cid_prefix, s.id);
                         } else {
 			                metrics.cmd_req.inc();
                             if let Some(ref lim) = sub_lim_opt {
@@ -941,11 +945,11 @@ async fn nostr_server(
                                     }
                                     if s.needs_historical_events() {
                                         // start a database query.  this spawns a blocking database query on a worker thread.
-                                        repo.query_subscription(s, cid.clone(), query_tx.clone(), abandon_query_rx).await.ok();
+                                        repo.query_subscription(s, cid_prefix.clone(), query_tx.clone(), abandon_query_rx).await.ok();
                                     }
                                 },
                                 Err(e) => {
-                                    info!("Subscription error: {} (cid: {}, sub: {:?})", e, cid, s.id);
+                                    info!("Subscription error: {} (cid: {}, sub: {:?})", e, cid_prefix, s.id);
                                     ws_stream.send(make_notice_message(&Notice::message(format!("Subscription error: {e}")))).await.ok();
                                 }
                             }
@@ -971,19 +975,19 @@ async fn nostr_server(
                         }
                     },
                     Err(Error::ConnError) => {
-                        debug!("got connection close/error, disconnecting cid: {}, ip: {:?}",cid, conn.ip());
+                        debug!("got connection close/error, disconnecting cid: {}, ip: {:?}",cid_prefix, conn.ip());
                         break;
                     }
                     Err(Error::EventMaxLengthError(s)) => {
-                        info!("client sent command larger ({} bytes) than max size (cid: {})", s, cid);
+                        info!("client sent command larger ({} bytes) than max size (cid: {})", s, cid_prefix);
                         ws_stream.send(make_notice_message(&Notice::message("event exceeded max size".into()))).await.ok();
                     },
                     Err(Error::ProtoParseError) => {
-                        info!("client sent command that could not be parsed (cid: {})", cid);
+                        info!("client sent command that could not be parsed (cid: {})", cid_prefix);
                         ws_stream.send(make_notice_message(&Notice::message("could not parse command".into()))).await.ok();
                     },
                     Err(e) => {
-                        info!("got non-fatal error from client (cid: {}, error: {:?}", cid, e);
+                        info!("got non-fatal error from client (cid: {}, error: {:?}", cid_prefix, e);
                     },
                 }
             },
@@ -995,7 +999,7 @@ async fn nostr_server(
     }
     debug!(
         "stopping client connection (cid: {}, ip: {:?}, sent: {} events, recv: {} events, connected: {:?})",
-        cid,
+        cid_prefix,
         conn.ip(),
         client_published_event_count,
         client_received_event_count,

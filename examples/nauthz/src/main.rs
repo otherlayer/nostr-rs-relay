@@ -182,6 +182,9 @@ pub async fn relay_grpc_client(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse().unwrap();
+
+    // when set, Decision::Unspecified is returned
+    // and we send nostr event using relay grpc server
     let external_event_processing = true;
 
     let (
