@@ -1,11 +1,8 @@
 use std::result;
-use std::thread;
 use std::io::{stdin, stdout, Read, Write};
-use std::sync::atomic::Ordering;
 use thiserror::Error;
 use tonic::{transport::Server, Request, Response, Status};
 use tokio::sync::mpsc;
-use tokio::runtime::Builder;
 
 use nauthz_grpc::relay_client::RelayClient;
 use nauthz_grpc::authorization_server::{Authorization, AuthorizationServer};
@@ -185,51 +182,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // when set, Decision::Unspecified is returned
     // and we send nostr event using relay grpc server
-    let external_event_processing = true;
+    let external_event_processing = false;
 
     let (
         admitted_event_tx, 
         admitted_event_rx
     ) = mpsc::channel::<GrpcEvent>(100);
 
-    let handle = thread::spawn(move || {
-        let rt = Builder::new_multi_thread()
-        .enable_all()
-        .thread_name_fn(|| {
-            // give each thread a unique numeric name
-            static ATOMIC_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let id = ATOMIC_ID.fetch_add(1,Ordering::SeqCst);
-            format!("tokio-ws-{id}")
-        })
-        .max_blocking_threads(4)
-        .build()
-        .unwrap();
+    if external_event_processing == true {
+        tokio::task::spawn(relay_grpc_client(admitted_event_rx));
+    }
 
-        rt.block_on( async {
-            if external_event_processing == true {
-                tokio::task::spawn(relay_grpc_client(admitted_event_rx));
-            }
+    // A simple authorization engine that allows kinds 0-3
+    let checker = EventAuthz {
+        allowed_kinds: vec![0, 1, 2, 3],
+        external_event_processing,
+        admitted_event_tx,
+    };
 
-            // A simple authorization engine that allows kinds 0-3
-            let checker = EventAuthz {
-                allowed_kinds: vec![0, 1, 2, 3],
-                external_event_processing,
-                admitted_event_tx,
-            };
-    
-            println!("EventAuthz Server listening on {}", addr);
-            // Start serving
-            let server = Server::builder()
-                .add_service(AuthorizationServer::new(checker))
-                .serve(addr);
+    println!("EventAuthz Server listening on {}", addr);
 
-            if let Err(e) = server.await {
-                eprintln!("server error: {e}");
-            }
-        });
-    });
-
-    handle.join().unwrap();
+    Server::builder()
+        .add_service(AuthorizationServer::new(checker))
+        .serve(addr)
+        .await.ok();
 
     Ok(())
 }

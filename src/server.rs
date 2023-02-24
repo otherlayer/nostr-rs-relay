@@ -46,7 +46,7 @@ use std::sync::mpsc::Receiver as MpscReceiver;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::runtime::Builder;
-use tokio::sync::broadcast::{self, Receiver, Sender};
+use tokio::sync::broadcast::{self, Receiver};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_tungstenite::WebSocketStream;
@@ -57,7 +57,6 @@ use tungstenite::handshake;
 use tungstenite::protocol::Message;
 use tungstenite::protocol::WebSocketConfig;
 use crate::server::Error::CommandUnknownError;
-use uuid::Uuid;
 
 /// Handle arbitrary HTTP requests, including for `WebSocket` upgrades.
 #[allow(clippy::too_many_arguments)]
@@ -66,8 +65,7 @@ async fn handle_web_request(
     repo: Arc<dyn NostrRepo>,
     settings: Settings,
     remote_addr: SocketAddr,
-    broadcast: Sender<Event>,
-    submitted_event_tx: tokio::sync::mpsc::Sender<SubmittedEvent>,
+    client_txs: ClientTxs,
     shutdown: Receiver<()>,
     favicon: Option<Vec<u8>>,
     registry: Registry,
@@ -108,6 +106,7 @@ async fn handle_web_request(
                                     Some(config),
                                 )
                                     .await;
+
                                 let origin = get_header_string("origin", request.headers());
                                 let user_agent = get_header_string("user-agent", request.headers());
                                 // determine the remote IP from headers if the exist
@@ -124,14 +123,14 @@ async fn handle_web_request(
                                     user_agent,
                                     origin,
                                 };
+
                                 // spawn a nostr server with our websocket
                                 tokio::spawn(nostr_server(
                                     repo,
                                     client_info,
                                     settings,
                                     ws_stream,
-                                    broadcast,
-                                    submitted_event_tx,
+                                    client_txs,
                                     shutdown,
                                     metrics,
                                 ));
@@ -461,12 +460,23 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         // build a repository for events
         let repo = db::build_repo(&settings, metrics.clone()).await;
 
-        // tokio::task::spawn(
-        //     validation::submitted_event_stresstest(
-        //         submitted_event_tx.clone(),
-        //     ));
-        // info!("event submit validator created");
+        // adding new and removing ws client notice channels
+        let (
+            add_notice_tx, 
+            add_notice_rx
+        ) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Notice>)>(128);
 
+        let (
+            remove_notice_tx, 
+            remove_notice_rx
+        ) = mpsc::channel::<Vec<u8>>(128);
+
+        let client_txs = ClientTxs {
+            submitted_event: submitted_event_tx.clone(),
+            bcast: bcast_tx.clone(),
+            add_notice_tx: add_notice_tx.clone(),
+            remove_notice_tx: remove_notice_tx.clone(),
+        };
 
         // start validation task.  Give it a channel for writing events,
         // and for publishing events are validated and ready to store/broadcast.
@@ -490,15 +500,18 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
                 settings.clone(),
                 admitted_event_rx,
                 bcast_tx.clone(),
-                shutdown_listen,
+                shutdown_listen.resubscribe(),
             ));
         info!("db writer created");
 
         if settings.grpc.enable_relay_server == Some(true) {
             tokio::task::spawn(
                 nostr_grpc_server(
-                    bcast_tx.clone(),
                     settings.grpc.relay_server_port,
+                    bcast_tx.clone(),
+                    add_notice_rx,
+                    remove_notice_rx,
+                    shutdown_listen,
                 )
             );
         }
@@ -556,9 +569,8 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         let make_svc = make_service_fn(|conn: &AddrStream| {
             let repo = repo.clone();
             let remote_addr = conn.remote_addr();
-            let bcast = bcast_tx.clone();
-            let event = submitted_event_tx.clone();
             let stop = invoke_shutdown.clone();
+            let txs = client_txs.clone();
             let settings = settings.clone();
             let favicon = favicon.clone();
             let registry = registry.clone();
@@ -571,8 +583,7 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
                         repo.clone(),
                         settings.clone(),
                         remote_addr,
-                        bcast.clone(),
-                        event.clone(),
+                        txs.clone(),
                         stop.subscribe(),
                         favicon.clone(),
                         registry.clone(),
@@ -648,6 +659,14 @@ struct ClientInfo {
     origin: Option<String>,
 }
 
+#[derive(Clone)]
+struct ClientTxs {
+    submitted_event: mpsc::Sender<SubmittedEvent>,
+    bcast: broadcast::Sender<Event>,
+    add_notice_tx: mpsc::Sender<(Vec<u8>, mpsc::Sender<Notice>)>,
+    remove_notice_tx: mpsc::Sender<Vec<u8>>,
+}
+
 /// Handle new client connections.  This runs through an event loop
 /// for all client communication.
 #[allow(clippy::too_many_arguments)]
@@ -656,17 +675,22 @@ async fn nostr_server(
     client_info: ClientInfo,
     settings: Settings,
     mut ws_stream: WebSocketStream<Upgraded>,
-    broadcast: Sender<Event>,
-    submitted_event_tx: mpsc::Sender<SubmittedEvent>,
+    client_txs: ClientTxs,
     mut shutdown: Receiver<()>,
     metrics: NostrMetrics,
 ) {
     // the time this websocket nostr server started
     let orig_start = Instant::now();
+
+    let submitted_event_tx = client_txs.submitted_event;
+    
+    let broadcast = client_txs.bcast;
+
     // get a broadcast channel for clients to communicate on
     let mut bcast_rx = broadcast.subscribe();
     // Track internal client state
     let mut conn = conn::ClientConn::new(client_info.remote_ip);
+
     // subscription creation rate limiting
     let mut sub_lim_opt = None;
     // 100ms jitter when the rate limiter returns
@@ -681,7 +705,6 @@ async fn nostr_server(
         }
     }
     let cid_prefix = conn.get_client_prefix();
-    let client_id = conn.get_client_id();
 
     // Create a channel for receiving query results from the database.
     // we will send out the tx handle to any query we generate.
@@ -691,6 +714,10 @@ async fn nostr_server(
     
     // Create channel for receiving NOTICEs
     let (notice_tx, mut notice_rx) = mpsc::channel::<Notice>(128);
+
+    let grpc_server_enabled = settings.grpc.enable_relay_server == Some(true);
+    let mut client_notice_tx_set = false;
+    let mut pubkey_blob: Option<Vec<u8>> = None;
 
     // last time this client sent data (message, ping, etc.)
     let mut last_message_time = Instant::now();
@@ -871,8 +898,24 @@ async fn nostr_server(
                                         source_ip: conn.ip().to_string(),
                                         origin: client_info.origin.clone(),
                                         user_agent: client_info.user_agent.clone(),
-                                        auth_pubkey };
-                                        submitted_event_tx.send(submit_event).await.ok();
+                                        auth_pubkey,
+                                    };
+
+                                    // when grpc server we store clients notice_tx for processing
+                                    if grpc_server_enabled && !client_notice_tx_set {
+                                        let pk = hex::decode(&e.pubkey).ok();
+
+                                        if let Some(p_key) = &pk {
+                                            if let Err(e) = client_txs.add_notice_tx.send((p_key.to_vec(), notice_tx.clone())).await {
+                                                error!("Error adding client notice tx to notice_handler: {}", e);
+                                            } else {
+                                                client_notice_tx_set = true;
+                                                pubkey_blob = pk;
+                                            }
+                                        }
+                                    }
+
+                                    submitted_event_tx.send(submit_event).await.ok();
                                     client_published_event_count += 1;
                                 } else {
                                     info!("client: {} sent a far future-dated event", cid_prefix);
@@ -997,6 +1040,13 @@ async fn nostr_server(
     for (_, stop_tx) in running_queries {
         stop_tx.send(()).ok();
     }
+
+    if grpc_server_enabled && client_notice_tx_set {
+        if let Some(key) = pubkey_blob {
+            client_txs.remove_notice_tx.try_send(key).ok();
+        }
+    }
+
     debug!(
         "stopping client connection (cid: {}, ip: {:?}, sent: {} events, recv: {} events, connected: {:?})",
         cid_prefix,

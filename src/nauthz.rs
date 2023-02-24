@@ -1,14 +1,19 @@
 use crate::error::{Error, Result};
 use crate::{event::Event, nip05::Nip05Name};
+use crate::notice::Notice;
 use nauthz_grpc::authorization_client::AuthorizationClient;
 use nauthz_grpc::event::TagEntry;
 use nauthz_grpc::relay_server::{Relay, RelayServer};
-use nauthz_grpc::{Decision, Event as GrpcEvent, EventReply, EventRequest, BroadcastEventRequest, BroadcastEventResponse};
-use tokio::sync::broadcast::Sender;
+use nauthz_grpc::{Decision, Event as GrpcEvent, EventReply, EventRequest, 
+    AdmitEventRequest, AdmitEventResponse, BlockedNoticeRequest, BlockedNoticeResponse,
+    BroadcastEventRequest, BroadcastEventResponse};
+use tokio::sync::broadcast::{Sender, Receiver};
+use tokio::sync::mpsc;
 use tracing::{info, warn, debug};
 
 use tonic::transport::Server;
 use tonic::{Request, Status, Response};
+use ahash::AHashMap;
 
 pub mod nauthz_grpc {
     tonic::include_proto!("nauthz");
@@ -85,7 +90,7 @@ impl EventAuthzService {
         origin: Option<String>,
         user_agent: Option<String>,
         nip05: Option<Nip05Name>,
-        auth_pubkey: Option<Vec<u8>>
+        auth_pubkey: Option<Vec<u8>>,
     ) -> Result<Box<dyn AuthzDecision>> {
         self.ready_connection().await;
         let id_blob = hex::decode(&event.id)?;
@@ -122,6 +127,21 @@ impl EventAuthzService {
 // Nostr relay server
 pub struct NostrRelay {
     bcast: Sender<Event>,
+    notice: mpsc::Sender<(Vec<u8>, Notice)>,
+}
+
+fn grpc_to_event(grpc_event: GrpcEvent) -> Event {
+    return Event {
+        id: hex::encode(grpc_event.id),
+        pubkey: hex::encode(grpc_event.pubkey),
+        delegated_by: None,
+        created_at: grpc_event.created_at,
+        kind: grpc_event.kind,
+        tags: protobuf_to_tags(&grpc_event.tags),
+        content: grpc_event.content,
+        sig: hex::encode(grpc_event.sig),
+        tagidx: None,
+    };
 }
 
 #[tonic::async_trait]
@@ -137,33 +157,75 @@ impl Relay for NostrRelay {
         debug!("recvd event for broadcast, kind={:?}, tag_count={}, content_sample={:?}]",
         grpc_event.kind, grpc_event.tags.len(), content_prefix);
 
-        let event = Event {
-            id: hex::encode(grpc_event.id),
-            pubkey: hex::encode(grpc_event.pubkey),
-            delegated_by: None,
-            created_at: grpc_event.created_at,
-            kind: grpc_event.kind,
-            tags: protobuf_to_tags(&grpc_event.tags),
-            content: grpc_event.content,
-            sig: hex::encode(grpc_event.sig),
-            tagidx: None,
-        };
+        let event = grpc_to_event(grpc_event);
 
         let result = self.bcast.send(event).is_ok();
 
-        Ok(Response::new(BroadcastEventResponse { admitted: result }))
+        Ok(Response::new(BroadcastEventResponse { broadcasted: result }))
+    }
+
+    async fn admit(
+        &self,
+        request: Request<AdmitEventRequest>,
+    ) -> Result<Response<AdmitEventResponse>, Status> {
+        let req = request.into_inner();
+        let grpc_event: GrpcEvent = req.event.unwrap();
+        let content_prefix: String = grpc_event.content.chars().take(40).collect();
+
+        debug!("recvd event to admit, kind={:?}, tag_count={}, content_sample={:?}]",
+        grpc_event.kind, grpc_event.tags.len(), content_prefix);
+
+        let event = grpc_to_event(grpc_event);
+
+        // let result = self.bcast.send(event).is_ok();
+
+        Ok(Response::new(AdmitEventResponse { admitted: true }))
+    }
+
+    async fn blocked_notice(
+        &self,
+        request: Request<BlockedNoticeRequest>,
+    ) -> Result<Response<BlockedNoticeResponse>, Status> {
+        let req = request.into_inner();
+        let id = hex::encode(req.id);
+        let msg = req.message.unwrap_or_else(|| "".to_string());
+
+        let ev_id: String = id.chars().take(8).collect();
+
+        debug!("blocked event id={:?}, msg={:?}]", ev_id, msg);
+        
+        let ok = self.notice.try_send((req.pubkey, Notice::blocked(id, &msg))).is_ok();
+
+        Ok(Response::new(BlockedNoticeResponse { ok: ok }))
     }
 }
 
 pub async fn nostr_grpc_server(
-    bcast: Sender<Event>,
     port: u32,
+    bcast: Sender<Event>,
+    add_notice_rx: mpsc::Receiver<(Vec<u8>, mpsc::Sender<Notice>)>,
+    remove_notice_rx: mpsc::Receiver<Vec<u8>>,
+    shutdown: Receiver<()>,
 ) -> Result<()> {
     let addr = format!("[::1]:{}", port).parse().unwrap();
 
-    // A simple authorization engine that allows kinds 0-3
+    // channel for notices to be sent by notice_handler
+    let (
+        notice_tx, 
+        notice_rx
+    ) = mpsc::channel::<(Vec<u8>, Notice)>(4096);
+
+    tokio::task::spawn(
+        notice_handler(
+            add_notice_rx,
+            remove_notice_rx,
+            notice_rx,
+            shutdown.resubscribe(),
+        ));
+
     let relay = NostrRelay {
         bcast,
+        notice: notice_tx,
     };
     info!("Relay gRPC Server listening on {}", addr);
     // Start serving
@@ -179,4 +241,34 @@ fn protobuf_to_tags(tags: &Vec<TagEntry>) -> Vec<Vec<String>> {
     tags.iter()
         .map(|x| x.clone().values.to_vec() )
         .collect()
+}
+
+pub async fn notice_handler(
+    mut add_notice_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, mpsc::Sender<Notice>)>,
+    mut remove_notice_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut notice_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, Notice)>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let mut client_notice_tx: AHashMap<Vec<u8>, mpsc::Sender<Notice>> = AHashMap::new();
+
+    loop {
+        if shutdown.try_recv().is_ok() {
+            info!("shutting down submission validator");
+            break;
+        }
+
+        tokio::select! {
+            Some((client_id, notice_tx)) = add_notice_rx.recv() => {
+                client_notice_tx.insert(client_id, notice_tx);
+            },
+            Some(client_id) = remove_notice_rx.recv() => {
+                client_notice_tx.remove(&client_id);
+            },
+            Some((client_id, notice)) = notice_rx.recv() => {
+                if let Some(notice_tx) = client_notice_tx.get(&client_id) {
+                    notice_tx.try_send(notice).ok();
+                }
+            },
+        }
+    }
 }

@@ -78,11 +78,6 @@ impl ClientConn {
     }
 
     #[must_use]
-    pub fn get_client_id(&self) -> String {
-        self.client_id.to_string().chars().collect()
-    }
-
-    #[must_use]
     pub fn ip(&self) -> &str {
         &self.client_ip_addr
     }

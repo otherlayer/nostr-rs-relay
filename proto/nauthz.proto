@@ -11,6 +11,8 @@ service Authorization {
 
 service Relay {
   rpc Broadcast(BroadcastEventRequest) returns (BroadcastEventResponse) {}
+  rpc Admit(AdmitEventRequest) returns (AdmitEventResponse) {}
+  rpc BlockedNotice(BlockedNoticeRequest) returns (BlockedNoticeResponse) {}
 }
 
 message Event {
@@ -69,6 +71,27 @@ message BroadcastEventRequest {
 }
 
 message BroadcastEventResponse {
+  bool broadcasted =
+      1; // event succesfully admitted for further processing
+}
+
+message AdmitEventRequest {
+  Event event =
+      1;  // the event to be admitted
+}
+
+message AdmitEventResponse {
   bool admitted =
       1; // event succesfully admitted for further processing
+}
+
+message BlockedNoticeRequest {
+  bytes id = 1;                // 32-byte SHA256 hash of serialized event
+  bytes pubkey = 2;            // 32-byte public key of event creator
+  optional string message = 3; // informative message for the client
+}
+
+message BlockedNoticeResponse {
+  bool ok =
+      1; // notice successfully sent to client
 }

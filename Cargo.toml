@@ -52,6 +52,7 @@ prometheus = "0.13.3"
 indicatif = "0.17.3"
 bech32 = "0.9.1"
 url = "2.3.1"
+ahash = "0.8.3"
 
 [dev-dependencies]
 anyhow = "1"
